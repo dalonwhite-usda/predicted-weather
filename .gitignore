@@ -1,0 +1,9 @@
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# Local CPC inputs and generated maps
+data/
+*.kmz
+output/
