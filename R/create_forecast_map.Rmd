@@ -1,0 +1,26 @@
+---
+title: "Create Forecast Map"
+output: html_document
+
+    
+---
+
+```{r create_forecast_map, echo=TRUE}
+source("R/create_forecast_map.R")
+
+forecast_files <- c(
+  temperature_6_10_day = "data/active/610temp_20261101.kmz"
+  ,  temperature_8_14_day = "data/active/814temp_20261101.kmz"
+  ,  temperature_3_4_week = "data/active/wk34temp_20261030.zip"
+  ,  precipitation_6_10_day = "data/active/610prcp_20261101.kmz"
+  ,  precipitation_8_14_day = "data/active/814prcp_20261101.kmz"
+  ,  precipitation_3_4_week = "data/active/wk34prcp_20261030.zip"
+#   , temperature_30_90_day = "path/to/temperature_file.zip"
+#   , precipitation_30_90_day = "path/to/precipitation_file.kmz"
+)
+
+create_forecast_map(
+  forecast_files,
+  output_file = "output/forecast_map.html"
+)
+```

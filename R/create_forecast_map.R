@@ -9,13 +9,20 @@ forecast_layer_names <- c(
   precipitation_30_90_day = "Precipitation: 30–90 day"
 )
 
-.validate_forecast_files <- function(kmz_files) {
-  if (!is.character(kmz_files) || is.null(names(kmz_files))) {
-    stop("`kmz_files` must be a named character vector.", call. = FALSE)
+.validate_forecast_files <- function(forecast_files) {
+  if (!is.character(forecast_files) || is.null(names(forecast_files))) {
+    stop("`forecast_files` must be a named character vector.", call. = FALSE)
   }
 
-  missing_names <- setdiff(names(forecast_layer_names), names(kmz_files))
-  extra_names <- setdiff(names(kmz_files), names(forecast_layer_names))
+  required_names <- setdiff(
+    names(forecast_layer_names),
+    c(
+      "temperature_3_4_week", "precipitation_3_4_week",
+      "temperature_30_90_day", "precipitation_30_90_day"
+    )
+  )
+  missing_names <- setdiff(required_names, names(forecast_files))
+  extra_names <- setdiff(names(forecast_files), names(forecast_layer_names))
   if (length(missing_names) || length(extra_names)) {
     details <- c(
       if (length(missing_names)) paste("missing:", paste(missing_names, collapse = ", ")),
@@ -25,17 +32,22 @@ forecast_layer_names <- c(
          call. = FALSE)
   }
 
-  kmz_files <- kmz_files[names(forecast_layer_names)]
-  missing_files <- kmz_files[!file.exists(kmz_files)]
+  forecast_files <- forecast_files[intersect(names(forecast_layer_names), names(forecast_files))]
+  missing_files <- forecast_files[!file.exists(forecast_files)]
   if (length(missing_files)) {
     stop("Forecast file(s) not found: ", paste(missing_files, collapse = ", "), call. = FALSE)
   }
-  if (any(tolower(tools::file_ext(kmz_files)) != "kmz")) {
-    stop("Every forecast input must be a KMZ file.", call. = FALSE)
+  supported_extensions <- c("kmz", "zip")
+  unsupported_files <- forecast_files[
+    !tolower(tools::file_ext(forecast_files)) %in% supported_extensions
+  ]
+  if (length(unsupported_files)) {
+    stop("Every forecast input must be a KMZ or ZIP file: ",
+         paste(unsupported_files, collapse = ", "), call. = FALSE)
   }
 
-  normalized_files <- normalizePath(kmz_files, mustWork = TRUE)
-  names(normalized_files) <- names(kmz_files)
+  normalized_files <- normalizePath(forecast_files, mustWork = TRUE)
+  names(normalized_files) <- names(forecast_files)
   normalized_files
 }
 
@@ -43,22 +55,24 @@ forecast_layer_names <- c(
   source_files <- path
   extraction_directory <- NULL
 
-  if (tolower(tools::file_ext(path)) == "kmz") {
-    extraction_directory <- tempfile("kmz-")
+  if (tolower(tools::file_ext(path)) %in% c("kmz", "zip")) {
+    extraction_directory <- tempfile("spatial-archive-")
     dir.create(extraction_directory)
     on.exit(unlink(extraction_directory, recursive = TRUE), add = TRUE)
     archive <- utils::unzip(path, list = TRUE)
-    kml_entries <- archive$Name[grepl("\\.kml$", archive$Name, ignore.case = TRUE)]
+    spatial_entries <- archive$Name[
+      grepl("\\.(kml|shp)$", archive$Name, ignore.case = TRUE)
+    ]
     unsafe_entries <- grepl("(^|[/\\\\])\\.\\.([/\\\\]|$)|^[/\\\\]|^[A-Za-z]:",
-                            kml_entries)
+                            archive$Name)
     if (any(unsafe_entries)) {
       stop("Unsafe path found in ", path, ".", call. = FALSE)
     }
-    if (!length(kml_entries)) {
-      stop("No KML document was found in ", path, ".", call. = FALSE)
+    if (!length(spatial_entries)) {
+      stop("No KML document or shapefile was found in ", path, ".", call. = FALSE)
     }
-    utils::unzip(path, files = kml_entries, exdir = extraction_directory)
-    source_files <- file.path(extraction_directory, kml_entries)
+    utils::unzip(path, exdir = extraction_directory)
+    source_files <- file.path(extraction_directory, spatial_entries)
   }
 
   spatial_layers <- unlist(lapply(source_files, function(source_file) {
@@ -68,7 +82,7 @@ forecast_layer_names <- c(
       if (is.na(sf::st_crs(layer))) {
         sf::st_crs(layer) <- 4326
       }
-      sf::st_transform(layer, 4326)
+      sf::st_make_valid(sf::st_transform(layer, 4326))
     })
   }), recursive = FALSE)
 
@@ -110,11 +124,27 @@ forecast_layer_names <- c(
   attributes <- sf::st_drop_geometry(data)
   preferred <- grep("^(name|label|title|description)$", names(attributes),
                     ignore.case = TRUE, value = TRUE)
-  if (!length(preferred)) {
-    return(rep(group, nrow(data)))
+  labels <- if (length(preferred)) {
+    as.character(attributes[[preferred[1]]])
+  } else {
+    rep(group, nrow(data))
   }
-  labels <- as.character(attributes[[preferred[1]]])
   labels[is.na(labels) | labels == ""] <- group
+
+  details <- grep("^(prob|cat)$", names(attributes),
+                  ignore.case = TRUE, value = TRUE)
+  if (length(details)) {
+    detail_text <- vapply(seq_len(nrow(attributes)), function(index) {
+      values <- vapply(details, function(column) {
+        value <- attributes[[column]][index]
+        if (is.na(value) || value == "") "" else paste(column, value, sep = ": ")
+      }, character(1))
+      paste(values[values != ""], collapse = " | ")
+    }, character(1))
+    labels <- ifelse(detail_text == "", labels,
+                     paste(labels, detail_text, sep = " | "))
+  }
+
   gsub("<[^>]+>", "", labels)
 }
 
@@ -171,7 +201,8 @@ forecast_layer_names <- c(
 
 #' Create an interactive CPC forecast map
 #'
-#' @param kmz_files A named character vector containing the eight CPC KMZ paths.
+#' @param kmz_files A named character vector containing the four required CPC
+#'   forecast paths and optional 3-4 week and 30-90 day forecast paths.
 #' @param dispersal_polygon Optional path to a vector file (including KMZ/KML,
 #'   GeoJSON, GeoPackage, or shapefile) or an `sf` object.
 #' @param output_file Destination HTML file.
@@ -200,17 +231,19 @@ create_forecast_map <- function(
   }
 
   map <- leaflet::leaflet(options = leaflet::leafletOptions(preferCanvas = TRUE))
-  map <- leaflet::addProviderTiles(map, "CartoDB.Positron", group = "Basemap")
+  map <- leaflet::addProviderTiles(map, "OpenStreetMap", group = "Basemap")
 
-  colors <- c(rep("#d73027", 4), rep("#4575b4", 4))
+  colors <- ifelse(
+    startsWith(names(forecast_layers), "temperature_"), "#d73027", "#4575b4"
+  )
   for (index in seq_along(forecast_layers)) {
-    group <- unname(forecast_layer_names[index])
+    group <- unname(forecast_layer_names[names(forecast_layers)[index]])
     for (layer in forecast_layers[[index]]) {
       map <- .add_spatial_layer(map, layer, group, colors[index])
     }
   }
 
-  overlay_groups <- unname(forecast_layer_names)
+  overlay_groups <- unname(forecast_layer_names[names(forecast_layers)])
   if (!is.null(dispersal_polygon)) {
     polygon_layers <- if (inherits(dispersal_polygon, "sf")) {
       if (is.na(sf::st_crs(dispersal_polygon))) {
@@ -240,7 +273,12 @@ create_forecast_map <- function(
     overlayGroups = overlay_groups,
     options = leaflet::layersControlOptions(collapsed = FALSE)
   )
-  map <- leaflet::hideGroup(map, unname(forecast_layer_names[-c(1, 5)]))
+  initially_hidden <- setdiff(
+    names(forecast_layers), c("temperature_6_10_day", "precipitation_6_10_day")
+  )
+  if (length(initially_hidden)) {
+    map <- leaflet::hideGroup(map, unname(forecast_layer_names[initially_hidden]))
+  }
 
   output_directory <- dirname(output_file)
   if (!dir.exists(output_directory)) {
