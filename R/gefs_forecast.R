@@ -179,11 +179,19 @@ download_gefs_forecast <- function(
   temperature <- .gefs_layer(data, "; Temperature \\[C\\]")
   maximum_temperature <- .gefs_layer(data, "Maximum temperature")
   minimum_temperature <- .gefs_layer(data, "Minimum temperature")
-  u_wind <- .gefs_layer(data, "u-component of wind")
-  v_wind <- .gefs_layer(data, "v-component of wind")
+  u_wind <- .gefs_layer(data, "u-component of wind") # east-west component of wind
+  v_wind <- .gefs_layer(data, "v-component of wind") # north-south component of wind
   precipitation <- .gefs_layer(data, "Total precipitation")
   wind_speed <- if (!is.null(u_wind) && !is.null(v_wind)) {
-    sqrt(u_wind^2 + v_wind^2)
+    sqrt(u_wind^2 + v_wind^2) # horizontal wind speed
+  } else {
+    NULL
+  }
+  wind_direction <- if (!is.null(u_wind) && !is.null(v_wind)) {
+    terra::lapp(c(u_wind, v_wind), function(u, v) {
+      direction <- atan2(u, v) * 180 / pi
+      (direction + 360) %% 360
+    })
   } else {
     NULL
   }
@@ -196,11 +204,20 @@ download_gefs_forecast <- function(
       minimum_temperature * 9 / 5 + 32
     },
     precipitation_mm = precipitation,
-    wind_max_mph = if (is.null(wind_speed)) NULL else wind_speed * 2.236936
+    wind_max_mph = if (is.null(wind_speed)) NULL else wind_speed * 2.236936,
+    wind_direction = wind_direction
   )
 }
 
 # Collapse a stack of rasters to one raster using the requested daily operation.
+.circular_mean <- function(values) {
+  values <- values[is.finite(values)]
+  if (!length(values)) return(NA_real_)
+  angle <- values * pi / 180
+  direction <- atan2(mean(sin(angle)), mean(cos(angle))) * 180 / pi
+  (direction + 360) %% 360
+}
+
 .aggregate_rasters <- function(rasters, method) {
   if (!length(rasters)) return(NULL)
   data <- terra::rast(rasters)
@@ -209,7 +226,8 @@ download_gefs_forecast <- function(
     mean = terra::app(data, mean, na.rm = TRUE),
     min = terra::app(data, min, na.rm = TRUE),
     max = terra::app(data, max, na.rm = TRUE),
-    sum = terra::app(data, sum, na.rm = TRUE)
+    sum = terra::app(data, sum, na.rm = TRUE),
+    circular_mean = terra::app(data, .circular_mean)
   )
 }
 
@@ -224,7 +242,8 @@ download_gefs_forecast <- function(
     temperature_max_f = "max",
     temperature_min_f = "min",
     precipitation_mm = "sum",
-    wind_max_mph = "max"
+    wind_max_mph = "max",
+    wind_direction = "circular_mean"
   )
   products <- list()
   for (day in days) {
@@ -243,6 +262,9 @@ download_gefs_forecast <- function(
 
 # Calculate one ensemble statistic, including threshold exceedance probabilities.
 .ensemble_statistic <- function(data, statistic) {
+  if (statistic == "circular_mean") {
+    return(terra::app(data, .circular_mean))
+  }
   if (statistic == "median") {
     return(terra::app(data, stats::median, na.rm = TRUE))
   }
@@ -344,8 +366,12 @@ process_gefs_forecast <- function(
     rows <- member_products$forecast_day == groups$forecast_day[index] &
       member_products$variable == groups$variable[index]
     ensemble <- terra::rast(member_products$file[rows])
-    statistics <- c("median", "p10", "p90")
     variable <- groups$variable[index]
+    statistics <- if (variable == "wind_direction") {
+      "circular_mean"
+    } else {
+      c("median", "p10", "p90")
+    }
     if (variable %in% names(thresholds)) {
       prefix <- if (variable == "temperature_max_f") {
         "probability_lt_"
@@ -392,7 +418,8 @@ process_gefs_forecast <- function(
     temperature_mean_f = c("#313695", "#ffffbf", "#a50026"),
     temperature_min_f = c("#313695", "#ffffbf", "#a50026"),
     precipitation_mm = c("#ffffff", "#74c476", "#00441b"),
-    wind_max_mph = c("#ffffff", "#fdae6b", "#7f0000")
+    wind_max_mph = c("#ffffff", "#fdae6b", "#7f0000"),
+    wind_direction = c("#440154", "#3b528b", "#21918c", "#5ec962", "#fde725", "#440154")
   )
 }
 
@@ -403,7 +430,8 @@ process_gefs_forecast <- function(
     temperature_max_f = "Maximum temperature (F)",
     temperature_min_f = "Minimum temperature (F)",
     precipitation_mm = "Precipitation (mm)",
-    wind_max_mph = "Maximum sustained wind (mph)"
+    wind_max_mph = "Maximum sustained wind (mph)",
+    wind_direction = "Wind direction (degrees)"
   )[[variable]]
 }
 
@@ -413,18 +441,27 @@ process_gefs_forecast <- function(
 #' @param forecast_day Day to display; defaults to the first complete day.
 #' @param output_file Destination HTML file.
 #' @param selfcontained Whether to embed widget dependencies.
+#' @param smooth_factor Integer raster upsampling factor. Values greater than
+#'   one use bilinear interpolation for continuous layers.
 #' @return The Leaflet widget, invisibly.
 create_gefs_map <- function(
     products,
     forecast_day = sort(unique(products$forecast_day))[1L],
     output_file = "output/gefs_forecast_map.html",
-    selfcontained = FALSE) {
-  # Select the median and threshold layers for one forecast day.
+    selfcontained = FALSE,
+    smooth_factor = 1L) {
+  # Select the primary and threshold layers for one forecast day.
   .require_gefs_packages(c("terra", "leaflet", "htmlwidgets"))
   forecast_day <- as.Date(forecast_day)
+  if (length(smooth_factor) != 1L || !is.numeric(smooth_factor) ||
+      !is.finite(smooth_factor) || smooth_factor < 1L ||
+      smooth_factor != as.integer(smooth_factor)) {
+    stop("`smooth_factor` must be a positive integer.", call. = FALSE)
+  }
+  smooth_factor <- as.integer(smooth_factor)
   selected <- products[
     products$forecast_day == forecast_day &
-      (products$statistic == "median" |
+      (products$statistic %in% c("median", "circular_mean") |
        startsWith(products$statistic, "probability_gt_") |
        startsWith(products$statistic, "probability_lt_")),
     , drop = FALSE
@@ -444,19 +481,33 @@ create_gefs_map <- function(
       below <- startsWith(selected$statistic[index], "probability_lt_")
       threshold <- sub("^probability_(gt|lt)_", "", selected$statistic[index])
       paste0("Probability: ", label, if (below) " < " else " > ", threshold)
+    } else if (selected$statistic[index] == "circular_mean") {
+      paste0("Circular mean: ", label)
     } else {
       paste0("Median: ", label)
     }
     raster <- terra::rast(selected$file[index])
+    smooth_layer <- smooth_factor > 1L &&
+      selected$variable[index] != "wind_direction"
+    if (smooth_layer) {
+      raster <- terra::disagg(raster, fact = smooth_factor, method = "bilinear")
+    }
     values <- terra::values(raster, na.rm = TRUE)
-    domain <- if (probability) c(0, 100) else range(values, finite = TRUE)
+    domain <- if (probability) {
+      c(0, 100)
+    } else if (selected$variable[index] == "wind_direction") {
+      c(0, 360)
+    } else {
+      range(values, finite = TRUE)
+    }
     palette <- leaflet::colorNumeric(
       .gefs_palette(selected$variable[index], probability), domain = domain,
       na.color = "transparent"
     )
     map <- leaflet::addRasterImage(
       map, raster, colors = palette, opacity = 0.7, group = groups[index],
-      project = TRUE, maxBytes = 8 * 1024 * 1024
+      project = TRUE, method = if (smooth_layer) "bilinear" else "auto",
+      maxBytes = 8 * 1024 * 1024
     )
     map <- leaflet::addLegend(
       map, pal = palette, values = values, title = groups[index],
