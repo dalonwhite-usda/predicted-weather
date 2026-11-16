@@ -106,12 +106,14 @@ aggregated in the Mountain time zone. The default operational products are:
 - daily mean, maximum, and minimum 2 m temperature in degrees Fahrenheit
 - daily accumulated precipitation in millimeters
 - daily maximum 10 m sustained wind in miles per hour
+- daily circular-mean 10 m wind direction in degrees
 - ensemble median and 10th and 90th percentiles
 - probabilities of maximum temperature above 100 F, precipitation above
   25.4 mm, and sustained wind above 25 mph
 
 Processed GeoTIFF files and CSV manifests remain under the run's `products`
-directory. The release writes `output/gefs/forecast_map.html` and
+directory. The daily maps include wind direction as a selectable circular-mean
+layer. The release writes `output/gefs/forecast_map.html` and
 `output/gefs/point_forecasts.png`. It also writes one interactive map per
 complete forecast day under `output/gefs/daily_maps`; `forecast_map.html` is
 the first complete day. The chart covers San Diego, Yuma, El Paso, Laredo, and
