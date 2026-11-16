@@ -1,3 +1,5 @@
+source("R/adult_survival.R", local = TRUE)
+
 gefs_default_bounds <- c(west = -118, east = -93, south = 23, north = 35)
 
 # Check that all packages needed by the current pipeline stage are installed.
@@ -238,6 +240,50 @@ download_gefs_forecast <- function(
       }
     }
   }
+
+  if (!"forecast_hour" %in% names(member_manifest) ||
+      anyDuplicated(member_manifest$forecast_hour)) {
+    stop("Survival requires unique forecast hours in the member manifest.",
+         call. = FALSE)
+  }
+  forecast_day_count <- min(
+    16L, floor(max(member_manifest$forecast_hour, na.rm = TRUE) / 24L)
+  )
+  expected_hours <- seq.int(6L, forecast_day_count * 24L, by = 6L)
+  if (forecast_day_count < 1L ||
+      !all(expected_hours %in% member_manifest$forecast_hour)) {
+    stop("Survival requires one temperature forecast every six hours through at least one complete day.",
+         call. = FALSE)
+  }
+  if (!length(days)) {
+    stop("No complete local forecast day is available to anchor the survival product.",
+         call. = FALSE)
+  }
+
+  daily_survival <- lapply(seq_len(forecast_day_count), function(day_index) {
+    forecast_hours <- seq.int((day_index - 1L) * 24L + 6L,
+                              day_index * 24L, by = 6L)
+    rows <- match(forecast_hours, member_manifest$forecast_hour)
+    temperature_rasters <- lapply(fields[rows], `[[`, "temperature_mean_f")
+    if (any(vapply(temperature_rasters, is.null, logical(1)))) {
+      stop("Temperature rasters are missing for a six-hour survival estimate.",
+           call. = FALSE)
+    }
+    survival_rasters <- lapply(temperature_rasters, function(raster) {
+      terra::app(raster, adult_survival_distro)
+    })
+    terra::app(terra::rast(survival_rasters), function(values) {
+      valid <- is.finite(values)
+      if (!any(valid)) NA_real_ else mean(values[valid])
+    })
+  })
+  cumulative_survival <- terra::app(terra::rast(daily_survival), function(values) {
+    if (any(!is.finite(values))) NA_real_ else prod(values)
+  })
+  survival_day <- as.Date(min(days), origin = "1970-01-01")
+  survival_variable <- paste0("survival_", forecast_day_count, "_day")
+  products[[paste(survival_day, survival_variable, sep = "|")]] <-
+    cumulative_survival
   products
 }
 
@@ -283,7 +329,9 @@ process_gefs_forecast <- function(
     output_directory = NULL) {
   # Validate the manifest and processing configuration before reading rasters.
   .require_gefs_packages("terra")
-  required_columns <- c("date", "cycle", "member", "valid_time", "file")
+  required_columns <- c(
+    "date", "cycle", "member", "forecast_hour", "valid_time", "file"
+  )
   if (!is.data.frame(manifest) || !all(required_columns %in% names(manifest))) {
     stop("`manifest` must be returned by `download_gefs_forecast()`.", call. = FALSE)
   }
@@ -386,6 +434,9 @@ process_gefs_forecast <- function(
 # Choose a continuous color scale for a variable or probability layer.
 .gefs_palette <- function(variable, probability = FALSE) {
   if (probability) return(c("#f7fbff", "#6baed6", "#08306b"))
+  if (grepl("^survival_[0-9]+_day$", variable)) {
+    return(c("#fff7bc", "#fec44f", "#d95f0e", "#993404"))
+  }
   switch(
     variable,
     temperature_max_f = c("#313695", "#ffffbf", "#a50026"),
@@ -398,6 +449,10 @@ process_gefs_forecast <- function(
 
 # Convert internal variable names into labels shown in maps and charts.
 .gefs_variable_label <- function(variable) {
+  if (grepl("^survival_[0-9]+_day$", variable)) {
+    days <- sub("^survival_([0-9]+)_day$", "\\1", variable)
+    return(paste0(days, "-day cumulative survival"))
+  }
   c(
     temperature_mean_f = "Mean temperature (F)",
     temperature_max_f = "Maximum temperature (F)",
@@ -419,14 +474,16 @@ create_gefs_map <- function(
     forecast_day = sort(unique(products$forecast_day))[1L],
     output_file = "output/gefs_forecast_map.html",
     selfcontained = FALSE) {
-  # Select the median and threshold layers for one forecast day.
+  # Select the median and threshold layers plus survival uncertainty bounds.
   .require_gefs_packages(c("terra", "leaflet", "htmlwidgets"))
   forecast_day <- as.Date(forecast_day)
   selected <- products[
     products$forecast_day == forecast_day &
       (products$statistic == "median" |
        startsWith(products$statistic, "probability_gt_") |
-       startsWith(products$statistic, "probability_lt_")),
+       startsWith(products$statistic, "probability_lt_") |
+      (grepl("^survival_[0-9]+_day$", products$variable) &
+        products$statistic %in% c("p10", "p90"))),
     , drop = FALSE
   ]
   if (!nrow(selected)) {
@@ -440,7 +497,13 @@ create_gefs_map <- function(
     probability <- startsWith(selected$statistic[index], "probability_gt_") ||
       startsWith(selected$statistic[index], "probability_lt_")
     label <- .gefs_variable_label(selected$variable[index])
-    groups[index] <- if (probability) {
+    is_survival <- grepl("^survival_[0-9]+_day$", selected$variable[index])
+    groups[index] <- if (is_survival) {
+      statistic_label <- c(
+        median = "Median", p10 = "10th percentile", p90 = "90th percentile"
+      )[[selected$statistic[index]]]
+      paste(statistic_label, label)
+    } else if (probability) {
       below <- startsWith(selected$statistic[index], "probability_lt_")
       threshold <- sub("^probability_(gt|lt)_", "", selected$statistic[index])
       paste0("Probability: ", label, if (below) " < " else " > ", threshold)
@@ -449,7 +512,16 @@ create_gefs_map <- function(
     }
     raster <- terra::rast(selected$file[index])
     values <- terra::values(raster, na.rm = TRUE)
-    domain <- if (probability) c(0, 100) else range(values, finite = TRUE)
+    domain <- if (probability) {
+      c(0, 100)
+    } else if (is_survival) {
+      survival_days <- as.integer(sub(
+        "^survival_([0-9]+)_day$", "\\1", selected$variable[index]
+      ))
+      c(0, 0.94^survival_days)
+    } else {
+      range(values, finite = TRUE)
+    }
     palette <- leaflet::colorNumeric(
       .gefs_palette(selected$variable[index], probability), domain = domain,
       na.color = "transparent"
